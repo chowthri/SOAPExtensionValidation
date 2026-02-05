@@ -1,18 +1,7 @@
-// .NET Framework 4.8 (ASMX) - Single-file SoapExtension validation + REST logging
-// - Validates BEFORE WebMethod executes (BeforeDeserialize)
-// - Validates ONLY the method you decorate (attribute on that method)
-// - Validates ONLY the parameter name you specify
-// - Catches: string -> numeric, out-of-range, custom min/max
-// - ResponseMode: SoapFault or Http400
-// - Logs failures to an existing REST API (FormUrlEncoded by default)
-
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Numerics;
-using System.Net.Http;
-using System.Net.Http.Headers;
+using System.Net;
 using System.Text;
 using System.Web;
 using System.Web.Services;
@@ -38,10 +27,6 @@ public sealed class SoapRangeValidateAttribute : SoapExtensionAttribute
 {
     public SoapRangeValidateAttribute(string paramName, NumericKind kind, string min, string max)
     {
-        if (paramName == null) throw new ArgumentNullException("paramName");
-        if (min == null) throw new ArgumentNullException("min");
-        if (max == null) throw new ArgumentNullException("max");
-
         ParamName = paramName;
         Kind = kind;
         Min = min;
@@ -56,12 +41,11 @@ public sealed class SoapRangeValidateAttribute : SoapExtensionAttribute
     public string ErrorMessage { get; set; } = "Invalid request parameter.";
     public ResponseMode ResponseMode { get; set; } = ResponseMode.SoapFault;
 
-    // If ResponseMode.Http400 and you still want SOAP XML fault body
+    // If ResponseMode.Http400, return SOAP XML fault body or plain text
     public bool Http400ReturnsSoapBody { get; set; } = false;
 
-    // REST logging config (optional)
+    // Logging API
     public string LogApiUrl { get; set; } = "";
-    public string LogApiBearerToken { get; set; } = "";
     public int LogApiTimeoutSeconds { get; set; } = 2;
 
     public override Type ExtensionType
@@ -74,85 +58,42 @@ public sealed class SoapRangeValidateAttribute : SoapExtensionAttribute
 
 #endregion
 
-#region REST Logger
+#region REST Logger (HttpWebRequest)
 
 internal static class RestErrorLogger
 {
-    private static readonly object _lock = new object();
-    private static readonly Dictionary<string, HttpClient> _clients = new Dictionary<string, HttpClient>(StringComparer.Ordinal);
-
-    private static HttpClient GetClient(string bearerToken, int timeoutSeconds)
-    {
-        if (bearerToken == null) bearerToken = "";
-        if (timeoutSeconds <= 0) timeoutSeconds = 2;
-
-        string key = timeoutSeconds.ToString() + "|" + bearerToken;
-
-        lock (_lock)
-        {
-            HttpClient existing;
-            if (_clients.TryGetValue(key, out existing))
-                return existing;
-
-            HttpClient c = new HttpClient();
-            c.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
-            c.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-
-            if (!string.IsNullOrWhiteSpace(bearerToken))
-                c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
-
-            _clients[key] = c;
-            return c;
-        }
-    }
-
-    public static void Log(string logApiUrl, string bearerToken, int timeoutSeconds,
-                           string message, Exception ex, string soapSnippet)
+    public static void Log(string logApiUrl, int timeoutSeconds, string message)
     {
         if (string.IsNullOrWhiteSpace(logApiUrl))
             return;
 
         try
         {
-            HttpContext ctx = HttpContext.Current;
+            string postData = "source=" + HttpUtility.UrlEncode("ASMX-SoapExtension") +
+                              "&message=" + HttpUtility.UrlEncode(message) +
+                              "&timestampUtc=" + HttpUtility.UrlEncode(DateTime.UtcNow.ToString("o"));
 
-            Dictionary<string, string> payload = new Dictionary<string, string>();
-            payload["source"] = "ASMX-SoapExtension";
-            payload["timestampUtc"] = DateTime.UtcNow.ToString("o");
-            payload["message"] = message ?? "";
+            byte[] data = Encoding.UTF8.GetBytes(postData);
 
-            if (ex != null)
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(logApiUrl);
+            req.Method = "POST";
+            req.ContentType = "application/x-www-form-urlencoded";
+            req.Timeout = timeoutSeconds <= 0 ? 2000 : timeoutSeconds * 1000;
+            req.ContentLength = data.Length;
+
+            using (Stream stream = req.GetRequestStream())
             {
-                payload["exceptionMessage"] = ex.Message;
-                payload["stackTrace"] = ex.StackTrace;
+                stream.Write(data, 0, data.Length);
             }
 
-            if (ctx != null && ctx.Request != null)
+            using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
             {
-                payload["url"] = ctx.Request.Url != null ? ctx.Request.Url.ToString() : "";
-                payload["httpMethod"] = ctx.Request.HttpMethod;
-                payload["clientIp"] = ctx.Request.UserHostAddress;
-            }
-
-            if (!string.IsNullOrWhiteSpace(soapSnippet))
-                payload["soapSnippet"] = soapSnippet;
-
-            // remove blanks
-            Dictionary<string, string> cleaned = payload
-                .Where(kv => !string.IsNullOrWhiteSpace(kv.Value))
-                .ToDictionary(kv => kv.Key, kv => kv.Value);
-
-            HttpClient client = GetClient(bearerToken, timeoutSeconds);
-
-            using (FormUrlEncodedContent content = new FormUrlEncodedContent(cleaned))
-            {
-                // Sync send (safe with short timeout). Logger must never break SOAP call.
-                client.PostAsync(logApiUrl, content).GetAwaiter().GetResult();
+                // ignore response
             }
         }
         catch
         {
-            // never throw from logger
+            // Never throw from logger
         }
     }
 }
@@ -168,14 +109,12 @@ public sealed class SoapRangeValidateExtension : SoapExtension
         public string MethodName;
         public string ParamName;
         public NumericKind Kind;
-        public BigInteger Min;
-        public BigInteger Max;
+        public string Min;
+        public string Max;
         public string ErrorMessage;
         public ResponseMode ResponseMode;
         public bool Http400ReturnsSoapBody;
-
         public string LogApiUrl;
-        public string LogApiBearerToken;
         public int LogApiTimeoutSeconds;
     }
 
@@ -192,26 +131,17 @@ public sealed class SoapRangeValidateExtension : SoapExtension
     {
         SoapRangeValidateAttribute a = (SoapRangeValidateAttribute)attribute;
 
-        BigInteger min, max;
-        if (!BigInteger.TryParse(a.Min, out min))
-            throw new InvalidOperationException("Invalid Min value '" + a.Min + "'.");
-        if (!BigInteger.TryParse(a.Max, out max))
-            throw new InvalidOperationException("Invalid Max value '" + a.Max + "'.");
-        if (min > max)
-            throw new InvalidOperationException("Min cannot be greater than Max.");
-
         Rule r = new Rule();
         r.MethodName = methodInfo.Name;
         r.ParamName = a.ParamName;
         r.Kind = a.Kind;
-        r.Min = min;
-        r.Max = max;
-        r.ErrorMessage = a.ErrorMessage ?? "Invalid request parameter.";
+        r.Min = a.Min;
+        r.Max = a.Max;
+        r.ErrorMessage = a.ErrorMessage;
         r.ResponseMode = a.ResponseMode;
         r.Http400ReturnsSoapBody = a.Http400ReturnsSoapBody;
-        r.LogApiUrl = a.LogApiUrl ?? "";
-        r.LogApiBearerToken = a.LogApiBearerToken ?? "";
-        r.LogApiTimeoutSeconds = a.LogApiTimeoutSeconds <= 0 ? 2 : a.LogApiTimeoutSeconds;
+        r.LogApiUrl = a.LogApiUrl;
+        r.LogApiTimeoutSeconds = a.LogApiTimeoutSeconds;
 
         return r;
     }
@@ -246,74 +176,185 @@ public sealed class SoapRangeValidateExtension : SoapExtension
             string raw = ExtractParamValue(soapXml, _rule.MethodName, _rule.ParamName);
             if (raw == null)
             {
-                Fail(_rule, "Missing required parameter '" + _rule.ParamName + "'.", soapXml, null);
+                Fail(_rule, "Missing required parameter '" + _rule.ParamName + "'.");
                 return;
             }
 
             raw = raw.Trim();
 
-            if (!ValidateNumeric(raw, _rule))
+            if (!IsValidInteger(raw))
             {
-                Fail(_rule, _rule.ErrorMessage, soapXml, null);
+                Fail(_rule, _rule.ErrorMessage + " (Not numeric)");
                 return;
             }
 
+            // Validate against Int32 / Int64 range first
+            if (_rule.Kind == NumericKind.Int32)
+            {
+                if (!IsInRange(raw, "-2147483648", "2147483647"))
+                {
+                    Fail(_rule, _rule.ErrorMessage + " (Out of Int32 range)");
+                    return;
+                }
+            }
+            else
+            {
+                if (!IsInRange(raw, "-9223372036854775808", "9223372036854775807"))
+                {
+                    Fail(_rule, _rule.ErrorMessage + " (Out of Int64 range)");
+                    return;
+                }
+            }
+
+            // Validate custom min/max
+            if (!IsInRange(raw, _rule.Min, _rule.Max))
+            {
+                Fail(_rule, _rule.ErrorMessage + " (Out of allowed range)");
+                return;
+            }
+
+            // allow request
             WriteBack(soapXml, _oldStream);
         }
         catch (Exception ex)
         {
-            Fail(_rule, "Invalid request.", soapXml, ex);
+            Fail(_rule, "Invalid request. " + ex.Message);
         }
     }
 
-    private static bool ValidateNumeric(string raw, Rule rule)
+    private static bool IsValidInteger(string value)
     {
-        BigInteger val;
-        if (!BigInteger.TryParse(raw, out val))
+        if (string.IsNullOrWhiteSpace(value))
             return false;
 
-        if (rule.Kind == NumericKind.Int32)
+        int start = 0;
+
+        if (value[0] == '+' || value[0] == '-')
         {
-            if (val < int.MinValue || val > int.MaxValue)
-                return false;
+            if (value.Length == 1) return false;
+            start = 1;
         }
-        else
+
+        for (int i = start; i < value.Length; i++)
         {
-            if (val < long.MinValue || val > long.MaxValue)
+            if (!char.IsDigit(value[i]))
                 return false;
         }
 
-        if (val < rule.Min || val > rule.Max)
+        return true;
+    }
+
+    // Compares numeric strings safely (no overflow)
+    private static bool IsInRange(string value, string min, string max)
+    {
+        if (CompareNumericStrings(value, min) < 0)
+            return false;
+
+        if (CompareNumericStrings(value, max) > 0)
             return false;
 
         return true;
     }
 
+    // Returns:
+    // -1 if a < b
+    //  0 if a == b
+    //  1 if a > b
+    private static int CompareNumericStrings(string a, string b)
+    {
+        a = NormalizeNumber(a);
+        b = NormalizeNumber(b);
+
+        bool aNeg = a.StartsWith("-");
+        bool bNeg = b.StartsWith("-");
+
+        if (aNeg && !bNeg) return -1;
+        if (!aNeg && bNeg) return 1;
+
+        if (!aNeg && !bNeg)
+        {
+            // both positive
+            return ComparePositive(a, b);
+        }
+        else
+        {
+            // both negative: reverse comparison
+            string ap = a.Substring(1);
+            string bp = b.Substring(1);
+            return -ComparePositive(ap, bp);
+        }
+    }
+
+    private static int ComparePositive(string a, string b)
+    {
+        // remove leading zeros
+        a = a.TrimStart('0');
+        b = b.TrimStart('0');
+
+        if (a.Length == 0) a = "0";
+        if (b.Length == 0) b = "0";
+
+        if (a.Length < b.Length) return -1;
+        if (a.Length > b.Length) return 1;
+
+        int cmp = string.CompareOrdinal(a, b);
+        if (cmp < 0) return -1;
+        if (cmp > 0) return 1;
+        return 0;
+    }
+
+    private static string NormalizeNumber(string v)
+    {
+        v = v.Trim();
+
+        if (v.StartsWith("+"))
+            v = v.Substring(1);
+
+        // Keep "-" if negative
+        if (v.StartsWith("-"))
+        {
+            string p = v.Substring(1).TrimStart('0');
+            if (p.Length == 0) p = "0";
+            return "-" + p;
+        }
+
+        v = v.TrimStart('0');
+        if (v.Length == 0) v = "0";
+
+        return v;
+    }
+
     private static bool IsCallForMethod(string soapXml, string methodName)
     {
         XDocument doc = XDocument.Parse(soapXml, LoadOptions.None);
+
         XElement body = doc.Descendants().FirstOrDefault(x => x.Name.LocalName == "Body");
-        if (body == null) return false;
+        if (body == null)
+            return false;
+
         return body.Descendants().Any(x => x.Name.LocalName == methodName);
     }
 
     private static string ExtractParamValue(string soapXml, string methodName, string paramName)
     {
         XDocument doc = XDocument.Parse(soapXml, LoadOptions.None);
+
         XElement body = doc.Descendants().FirstOrDefault(x => x.Name.LocalName == "Body");
-        if (body == null) return null;
+        if (body == null)
+            return null;
 
         XElement op = body.Descendants().FirstOrDefault(x => x.Name.LocalName == methodName);
-        if (op == null) return null;
+        if (op == null)
+            return null;
 
         XElement p = op.Elements().FirstOrDefault(x => x.Name.LocalName == paramName);
         return p != null ? p.Value : null;
     }
 
-    private static void Fail(Rule rule, string message, string soapXml, Exception ex)
+    private static void Fail(Rule rule, string message)
     {
-        RestErrorLogger.Log(rule.LogApiUrl, rule.LogApiBearerToken, rule.LogApiTimeoutSeconds,
-            "SOAP Validation Failed: " + message, ex, SafeSnippet(soapXml));
+        // Call REST API logger
+        RestErrorLogger.Log(rule.LogApiUrl, rule.LogApiTimeoutSeconds, message);
 
         if (rule.ResponseMode == ResponseMode.Http400)
         {
@@ -339,7 +380,6 @@ public sealed class SoapRangeValidateExtension : SoapExtension
             }
         }
 
-        // Default SOAP fault (SOAP clients typically expect this)
         throw new SoapException(message, new System.Xml.XmlQualifiedName("Client", SoapException.Namespace));
     }
 
@@ -363,6 +403,7 @@ public sealed class SoapRangeValidateExtension : SoapExtension
     private static string BuildSoapFaultXml(string msg)
     {
         string safe = System.Security.SecurityElement.Escape(msg);
+
         return
 @"<?xml version=""1.0"" encoding=""utf-8""?>
 <soap:Envelope xmlns:soap=""http://schemas.xmlsoap.org/soap/envelope/"">
@@ -374,42 +415,35 @@ public sealed class SoapRangeValidateExtension : SoapExtension
   </soap:Body>
 </soap:Envelope>";
     }
-
-    private static string SafeSnippet(string soapXml)
-    {
-        if (string.IsNullOrEmpty(soapXml)) return null;
-        int max = 2000;
-        return soapXml.Length <= max ? soapXml : soapXml.Substring(0, max);
-    }
 }
 
 #endregion
 
-#region Example ASMX WebService Usage
+#region Example ASMX WebService
 
 [WebService(Namespace = "http://tempuri.org/")]
 public class MyService : WebService
 {
-    // Your exact usage example:
+    // Your exact usage:
     [WebMethod]
     [SoapRangeValidate("id", NumericKind.Int64, "1", "9999999999",
         ErrorMessage = "Invalid id",
         ResponseMode = ResponseMode.Http400,
         Http400ReturnsSoapBody = false,
-        LogApiUrl = "https://your-domain/api/logs",   // <-- change to your REST logging API
-        LogApiBearerToken = "",                       // <-- if needed
+        LogApiUrl = "https://your-domain/api/logs",
         LogApiTimeoutSeconds = 2)]
     public string test123(long id)
     {
         return "SUCCESS";
     }
 
-    // SOAP fault response example:
+    // SOAP Fault example:
     [WebMethod]
     [SoapRangeValidate("age", NumericKind.Int32, "0", "120",
         ErrorMessage = "Invalid age",
         ResponseMode = ResponseMode.SoapFault,
-        LogApiUrl = "https://your-domain/api/logs")]
+        LogApiUrl = "https://your-domain/api/logs",
+        LogApiTimeoutSeconds = 2)]
     public string testInt(int age)
     {
         return "SUCCESS";
